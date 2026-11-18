@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark"><title>Rust Proxy · 流量监控</title>
+<script>
+const themeKey = 'rust-proxy.theme';
+const systemDark = window.matchMedia('(prefers-color-scheme: dark)');
+let selectedTheme = 'system';
+try {
+  const saved = localStorage.getItem(themeKey);
+  if (saved === 'light' || saved === 'dark') selectedTheme = saved;
+} catch { /* Storage may be disabled. */ }
+function applyTheme() {
+  document.documentElement.dataset.theme = selectedTheme === 'system'
+    ? (systemDark.matches ? 'dark' : 'light') : selectedTheme;
+}
+applyTheme();
+systemDark.addEventListener('change', applyTheme);
+</script>
+<style>
+:root {
+  color-scheme: light;
+  --bg:#f5f7f6; --panel:#fff; --text:#19231f; --line:#c7d2cc;
+  --muted:#506057; --accent:#21613e; --on-accent:#fff;
+  --selected:#e0efe5; --selected-line:#82a88d; --table-head:#e9efeb;
+  --error:#993812; --pending:#99631a;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg:#111516; --panel:#181e20; --text:#f0f4f1; --line:#323b3d;
+  --muted:#a1b1b1; --accent:#a6edc2; --on-accent:#11291c;
+  --selected:#2b3c34; --selected-line:#486452; --table-head:#202728;
+  --error:#ffb89d; --pending:#d6a662;
+}
+.header-tools,.theme-control{display:flex;align-items:center;gap:8px}
+.header-tools{flex-wrap:wrap;justify-content:flex-end;gap:8px 16px}
+header>.wrap{flex-wrap:wrap;padding-block:12px}
+header .brand{padding-block:0}
+.theme-control{color:var(--muted);font-size:13px}
+.theme-control select{font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:6px;cursor:pointer}
+.theme-control select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 Inter,system-ui,sans-serif}
+header{border-bottom:1px solid var(--line)}.wrap{max-width:1370px;margin:auto;padding:0 clamp(16px,4vw,64px)}header>.wrap,.bar,footer{display:flex;align-items:center;justify-content:space-between;gap:16px}.brand{display:flex;align-items:center;gap:12px;font:600 17px var(--mono);padding:20px 0}.icon{display:inline-grid;place-items:center;width:32px;height:32px;border-radius:6px;background:var(--accent);color:var(--on-accent);font-weight:800}.status{color:var(--muted);font-size:13px}.status:before{content:"";display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--pending);margin-right:8px}.status.online:before{background:var(--accent)}
+main{padding-bottom:60px!important}h1{font-size:clamp(28px,4vw,40px);letter-spacing:-.05em;margin:38px 0 20px}.stats{display:grid;grid-template-columns:minmax(220px,1.8fr) repeat(3,minmax(120px,1fr));background:var(--panel);border:1px solid var(--line);border-radius:10px}.metric{padding:20px;min-width:0}.metric+.metric{border-left:1px solid var(--line)}.metric small,.meta,footer{color:var(--muted);font-size:13px}.value{display:block;font:500 26px/1.4 var(--mono);margin-top:7px;overflow-wrap:anywhere}.upstream{font-size:19px;color:var(--accent)}.meta{margin:12px 0 36px}.bar{margin-bottom:14px}h2{font-size:21px;margin:0}.tabs{display:flex;gap:4px}.tabs button[aria-pressed=true]{background:var(--selected);color:var(--accent);border-color:var(--selected-line)}
+button{font:inherit;font-size:13px;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:7px 12px;cursor:pointer}button:disabled{opacity:.4;cursor:default}button:focus-visible{outline:2px solid var(--accent)}.scroll{overflow:auto;border:1px solid var(--line);border-radius:8px}table{width:100%;border-collapse:collapse;white-space:nowrap;font:13px/1.6 var(--mono)}th{background:var(--table-head);text-align:left;color:var(--muted);font:500 12px system-ui}th,td{padding:12px;border-bottom:1px solid var(--line)}tr:last-child td{border:0}td.target{min-width:180px;max-width:420px;white-space:normal;overflow-wrap:anywhere}td.result{max-width:220px;white-space:normal}.ok{color:var(--accent)}.bad{color:var(--error)}.empty{text-align:center;color:var(--muted);height:130px;font:14px system-ui}footer{margin-top:15px}footer button{margin-left:4px}
+@media(max-width:760px){.stats{grid-template-columns:1fr 1fr}.metric{padding:14px}.metric:nth-child(3){border-left:0}.metric:nth-child(n+3){border-top:1px solid var(--line)}.value{font-size:19px}.meta{margin-bottom:24px}}
+.egress{margin:0 0 30px;padding:18px 20px;border:1px solid var(--line);border-radius:8px}
+.egress h2{font-size:17px}.egress .bar{margin-bottom:14px}
+.egress dl{display:grid;grid-template-columns:1.3fr 1.2fr 1.5fr .7fr;gap:16px;margin:0}
+.egress dt{font-size:12px;color:var(--muted)}.egress dd{margin:4px 0 0;overflow-wrap:anywhere}
+#exit-ip,#exit-asn{font-family:var(--mono)}#exit-ip{color:var(--accent)}
+#exit-status{margin:14px 0 0;font-size:12px;color:var(--muted)}#exit-status.bad{color:var(--error)}
+@media(max-width:760px){.egress dl{grid-template-columns:1fr 1fr}.egress{padding:14px}}
+</style>
+<header>
+  <div class="wrap">
+    <div class="brand"><span class="icon" aria-hidden="true">⇄</span>Rust Proxy</div>
+    <div class="header-tools">
+      <span id="status" class="status" role="status">正在连接</span>
+      <label class="theme-control">主题
+        <select id="theme">
+          <option value="system">跟随系统</option>
+          <option value="light">浅色</option>
+          <option value="dark">深色</option>
+        </select>
+      </label>
+    </div>
+  </div>
+</header>
+<main class="wrap">
+<h1>流量监控</h1>
+<div class="stats">
+<div class="metric"><small>当前上游</small><strong class="value upstream" id="upstream">—</strong></div>
+<div class="metric"><small>活动连接与请求</small><strong class="value" id="active">—</strong></div>
+<div class="metric"><small>活动流量 · 上传</small><strong class="value" id="up">—</strong></div>
+<div class="metric"><small>活动流量 · 下载</small><strong class="value" id="down">—</strong></div>
+</div>
+<p class="meta" id="entry">正在读取代理配置…</p>
+<section class="egress" aria-labelledby="exit-heading">
+<div class="bar"><h2 id="exit-heading">代理出口</h2><button id="exit-refresh" type="button">重新检测</button></div>
+<dl>
+<div><dt>落地 IP</dt><dd id="exit-ip">—</dd></div>
+<div><dt>IP 归属地</dt><dd id="exit-location">—</dd></div>
+<div><dt>网络运营商</dt><dd id="exit-network">—</dd></div>
+<div><dt>自治系统号</dt><dd id="exit-asn">—</dd></div>
+</dl>
+<p id="exit-status" role="status">正在通过上游检测…</p>
+</section>
+<div class="bar"><h2>请求记录</h2><div class="tabs"><button id="all" aria-pressed="true">全部</button><button id="live" aria-pressed="false">进行中</button></div></div>
+<div class="scroll"><table><thead><tr><th>开始时间</th><th>入口</th><th>方法</th><th>目标</th><th>状态</th><th>耗时</th><th>上传</th><th>下载</th></tr></thead><tbody id="rows"></tbody></table></div>
+<footer><span id="range"></span><div><button id="newer" disabled>较新记录</button><button id="older" disabled>较早记录</button></div></footer>
+</main>
+<script>
+const el=id=>document.getElementById(id);
+const themeSelect = el('theme');
+themeSelect.value = selectedTheme;
+themeSelect.addEventListener('change', () => {
+  selectedTheme = themeSelect.value;
+  applyTheme();
+  try { localStorage.setItem(themeKey, selectedTheme); } catch { /* Apply for this tab. */ }
+});
+const set=(id,value)=>{el(id).textContent=value};
+const fmt=n=>{const units=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<units.length-1){n/=1024;i++}return (i?n.toFixed(1):n)+' '+units[i]};
+let source, activeOnly=false, cursors=[null], last=null;
+const time=new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
+function render(data){
+  set('active',data.active);set('up',fmt(data.up));set('down',fmt(data.down));
+  const body=document.createDocumentFragment();
+  for(const r of data.rows){
+    const tr=document.createElement('tr');
+    const age=Math.max(0,(r.ended??Date.now())-r.started);
+    const outcome=({active:'进行中',ok:'完成',interrupted:'已中断'})[r.outcome]??r.outcome;
+    const cells=[time.format(r.started),r.protocol,r.method,r.target,[r.status,outcome].filter(Boolean).join(' · '),age<1000?age+' ms':(age/1000).toFixed(1)+' s',fmt(r.up),fmt(r.down)];
+    for(const [i,value] of cells.entries()){const td=document.createElement('td');td.textContent=value;if(i===3){td.className='target';td.title='上游 '+r.upstream}if(i===4)td.className='result '+(['active','ok'].includes(r.outcome)?'ok':'bad');tr.append(td)}
+    body.append(tr);
+  }
+  if(!data.rows.length){const td=document.createElement('td');td.colSpan=8;td.className='empty';td.textContent=activeOnly?'当前没有活动连接':'等待第一个代理请求';const tr=document.createElement('tr');tr.append(td);body.append(tr)}
+  el('rows').replaceChildren(body);
+  last=data.rows.at(-1)?.id;el('older').disabled=!data.more;el('newer').disabled=cursors.length===1;
+  set('range',data.rows.length?'本页 '+data.rows.length+' 条':'0 条记录');
+}
+function connect(){
+  source?.close();
+  el('older').disabled=true;el('newer').disabled=true;
+  const p=new URLSearchParams({active:String(activeOnly)});if(cursors.at(-1)!=null)p.set('before',cursors.at(-1));
+  source=new EventSource('/api/events?'+p);
+  source.onmessage=e=>{render(JSON.parse(e.data));el('status').className='status online';set('status','实时更新')};
+  source.onerror=()=>{el('status').className='status';set('status','连接中断，正在重连')};
+  source.addEventListener('journal-error',()=>{el('status').className='status';set('status','记录读取失败')});
+}
+function mode(active){activeOnly=active;cursors=[null];el('all').setAttribute('aria-pressed',String(!active));el('live').setAttribute('aria-pressed',String(active));connect()}
+let exitTimer;
+function showExit(info){
+  let country=info?.country;
+  if(/^[A-Z]{2}$/.test(info?.country_code)){
+    country=new Intl.DisplayNames(['zh-CN'],{type:'region'}).of(info.country_code);
+  }
+  const location=[...new Set([country,info?.region,info?.city].filter(Boolean))];
+  const network=info?.connection;
+  set('exit-ip',info?.ip??'—');
+  set('exit-location',location.join(' · ')||'—');
+  set('exit-network',network?.isp||network?.org||'—');
+  set('exit-asn',network?.asn?'AS'+network.asn:'—');
+}
+async function checkExit(refresh=false){
+  clearTimeout(exitTimer);
+  const button=el('exit-refresh');
+  button.disabled=true;
+  el('exit-status').className='';
+  set('exit-status','正在通过上游检测…');
+  let delay=30000;
+  try {
+    const res=await fetch('/api/egress',{method:refresh?'POST':'GET',cache:'no-store'});
+    if(!res.ok)throw Error('面板服务返回 HTTP '+res.status);
+    const report=await res.json();
+    const checked=time.format(report.checked_at);
+    if(report.status==='error')throw Error(checked+' · '+report.message);
+    showExit(report.info);
+    set('exit-status','检测于 '+checked+' · ipwho.is');
+    delay=Math.max(1000,Math.min(600000,report.checked_at+600000-Date.now()));
+  } catch(error) {
+    showExit(null);
+    el('exit-status').className='bad';
+    set('exit-status','检测失败 · '+error.message);
+  } finally {
+    button.disabled=false;
+    exitTimer=setTimeout(()=>checkExit(),delay);
+  }
+}
+el('exit-refresh').onclick=()=>checkExit(true);
+el('all').onclick=()=>mode(false);el('live').onclick=()=>mode(true);
+el('older').onclick=()=>{cursors.push(last);connect()};el('newer').onclick=()=>{cursors.pop();connect()};
+fetch('/api/config').then(r=>r.json()).then(c=>{set('upstream',c.upstream);set('entry','代理入口  '+c.listen+'　·　HTTP / SOCKS5'+(c.tls?' / HTTPS':''))}).catch(()=>set('entry','配置读取失败'));
+connect();
+checkExit();
+</script>
+</html>

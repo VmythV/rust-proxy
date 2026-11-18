@@ -1,0 +1,14 @@
+# 复制为 proxy.toml，把 upstream 改成实际的上游地址。
+upstream = "socks5://127.0.0.1:1080"
+proxy_listen = "127.0.0.1:20808"
+web_listen = "127.0.0.1:20809"
+database = "traffic.sqlite3"
+connect_timeout_seconds = 10
+response_timeout_seconds = 300
+
+# HTTPS 代理入口需要同时设置下列两个 PEM 文件。
+# inbound_cert = "proxy-cert.pem"
+# inbound_key = "proxy-key.pem"
+
+# HTTPS 上游默认使用系统信任根。私有 CA 可在这里添加。
+# upstream_ca = "upstream-ca.pem"

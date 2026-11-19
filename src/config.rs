@@ -11,7 +11,10 @@ use std::{
 };
 use tokio_rustls::{
     TlsAcceptor, TlsConnector,
-    rustls::{ClientConfig, RootCertStore, ServerConfig, pki_types::CertificateDer},
+    rustls::{
+        ClientConfig, RootCertStore, ServerConfig,
+        pki_types::{CertificateDer, ServerName},
+    },
 };
 use url::Url;
 
@@ -50,12 +53,20 @@ fn response_timeout_secs() -> u64 {
     300
 }
 
+pub enum Protocol {
+    Http,
+    Socks5,
+    Vless(crate::vless::Vless),
+    #[cfg(unix)]
+    Xray(crate::xray::Relay),
+}
+
 pub struct Upstream {
     pub host: String,
     pub port: u16,
-    pub socks: bool,
+    pub protocol: Protocol,
     pub credentials: Option<(String, String)>,
-    pub tls: Option<TlsConnector>,
+    pub tls: Option<(TlsConnector, ServerName<'static>)>,
     pub label: String,
     pub timeout: Duration,
     pub response_timeout: Duration,
@@ -73,7 +84,7 @@ fn certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     Ok(certificates)
 }
 
-pub fn client_tls(extra_ca: Option<&Path>) -> Result<TlsConnector> {
+pub fn client_tls(extra_ca: Option<&Path>, http1: bool) -> Result<TlsConnector> {
     let mut roots = RootCertStore::empty();
     roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
     if let Some(path) = extra_ca {
@@ -82,11 +93,13 @@ pub fn client_tls(extra_ca: Option<&Path>) -> Result<TlsConnector> {
         }
     }
     ensure!(!roots.is_empty(), "no trusted TLS roots");
-    Ok(TlsConnector::from(Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    )))
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    if http1 {
+        config.alpn_protocols.push(b"http/1.1".to_vec());
+    }
+    Ok(TlsConnector::from(Arc::new(config)))
 }
 
 impl Config {
@@ -112,47 +125,90 @@ impl Config {
         Ok(c)
     }
 
-    pub fn upstream(&self) -> Result<Upstream> {
+    pub async fn upstream(&self) -> Result<(Upstream, Option<tokio::process::Child>)> {
         let u = Url::parse(&self.upstream).map_err(|_| anyhow::anyhow!("invalid upstream URL"))?;
-        let socks = u.scheme() == "socks5";
-        ensure!(
-            socks || matches!(u.scheme(), "http" | "https"),
-            "expected socks5, http or https upstream"
-        );
-        ensure!(
-            matches!(u.path(), "" | "/") && u.query().is_none() && u.fragment().is_none(),
-            "unexpected upstream path, query or fragment"
-        );
+        ensure!(matches!(u.path(), "" | "/"), "unexpected upstream path");
         let address = u.host_str().context("missing upstream host")?;
         let host = address
             .trim_start_matches('[')
             .trim_end_matches(']')
             .to_owned();
-        let port = u.port_or_known_default().unwrap_or(1080);
+        let (protocol, tls_name, port, worker) = match u.scheme() {
+            "vless" => {
+                let port = u
+                    .port()
+                    .filter(|&p| p != 0)
+                    .context("VLESS requires a nonzero port")?;
+                match crate::vless::Vless::from_url(&u, &host, self.upstream_ca.as_deref())? {
+                    crate::vless::Settings::Native(vless, name) => {
+                        (Protocol::Vless(vless), name, port, None)
+                    }
+                    #[cfg(unix)]
+                    crate::vless::Settings::Xray(outbound) => {
+                        let (relay, child) = crate::xray::Relay::start(
+                            outbound,
+                            Duration::from_secs(self.connect_timeout_seconds),
+                        )
+                        .await?;
+                        (Protocol::Xray(relay), None, port, Some(child))
+                    }
+                    #[cfg(not(unix))]
+                    crate::vless::Settings::Xray(_outbound) => bail!(
+                        "managed Xray requires Unix sockets; configure a local Xray SOCKS5 upstream on this platform"
+                    ),
+                }
+            }
+            "http" | "https" | "socks5" => {
+                ensure!(
+                    u.query().is_none() && u.fragment().is_none(),
+                    "unexpected upstream query or fragment"
+                );
+                let protocol = if u.scheme() == "socks5" {
+                    Protocol::Socks5
+                } else {
+                    Protocol::Http
+                };
+                (
+                    protocol,
+                    (u.scheme() == "https").then(|| host.clone()),
+                    u.port_or_known_default().unwrap_or(1080),
+                    None,
+                )
+            }
+            _ => bail!("expected socks5, http, https or vless upstream"),
+        };
         ensure!(port != 0, "invalid upstream port");
-        let credentials = if u.username().is_empty() && u.password().is_none() {
-            None
-        } else {
-            let decode = |s: &str| -> Result<String> {
-                Ok(percent_decode_str(s).decode_utf8()?.into_owned())
+        let credentials =
+            if u.scheme() == "vless" || (u.username().is_empty() && u.password().is_none()) {
+                None
+            } else {
+                let decode = |s: &str| -> Result<String> {
+                    Ok(percent_decode_str(s).decode_utf8()?.into_owned())
+                };
+                Some((decode(u.username())?, decode(u.password().unwrap_or(""))?))
             };
-            Some((decode(u.username())?, decode(u.password().unwrap_or(""))?))
-        };
-        let tls = if u.scheme() == "https" {
-            Some(client_tls(self.upstream_ca.as_deref())?)
+        let tls = if let Some(name) = tls_name {
+            let http1 = matches!(&protocol, Protocol::Vless(v) if v.websocket.is_some());
+            Some((
+                client_tls(self.upstream_ca.as_deref(), http1)?,
+                ServerName::try_from(name).context("invalid upstream TLS name")?,
+            ))
         } else {
             None
         };
-        Ok(Upstream {
-            host,
-            port,
-            socks,
-            credentials,
-            tls,
-            label: format!("{}://{}:{}", u.scheme(), address, port),
-            timeout: Duration::from_secs(self.connect_timeout_seconds),
-            response_timeout: Duration::from_secs(self.response_timeout_seconds),
-        })
+        Ok((
+            Upstream {
+                host,
+                port,
+                protocol,
+                credentials,
+                tls,
+                label: format!("{}://{}:{}", u.scheme(), address, port),
+                timeout: Duration::from_secs(self.connect_timeout_seconds),
+                response_timeout: Duration::from_secs(self.response_timeout_seconds),
+            },
+            worker,
+        ))
     }
 
     pub fn inbound_tls(&self) -> Result<Option<TlsAcceptor>> {

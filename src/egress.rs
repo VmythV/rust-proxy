@@ -106,7 +106,7 @@ impl EgressLookup {
             .await
             .map_err(|e| anyhow::anyhow!("上游连接失败（{e}）"))?;
         // The lookup service uses the system's roots. upstream_ca only trusts the upstream.
-        let tls = tokio::task::spawn_blocking(|| client_tls(None))
+        let tls = tokio::task::spawn_blocking(|| client_tls(None, false))
             .await?
             .context("无法加载查询服务的受信任证书")?;
         let stream = tls

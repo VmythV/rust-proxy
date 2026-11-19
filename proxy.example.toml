@@ -1,5 +1,8 @@
 # 复制为 proxy.toml，把 upstream 改成实际的上游地址。
 upstream = "socks5://127.0.0.1:1080"
+# VLESS over WSS 示例。使用时替换上面的 upstream，填写自己的 UUID、地址、路径和域名。
+# 若节点提供了 encryption、flow 或 fp，请保留完整分享链接；高级参数需要 PATH 中的 xray。
+# upstream = "vless://00112233-4455-6677-8899-aabbccddeeff@node.example.com:443?type=ws&security=tls&encryption=none&path=%2Fproxy&host=edge.example.com&sni=edge.example.com"
 proxy_listen = "127.0.0.1:20808"
 web_listen = "127.0.0.1:20809"
 database = "traffic.sqlite3"
@@ -10,5 +13,5 @@ response_timeout_seconds = 300
 # inbound_cert = "proxy-cert.pem"
 # inbound_key = "proxy-key.pem"
 
-# HTTPS 上游默认使用系统信任根。私有 CA 可在这里添加。
+# HTTPS 和 VLESS TLS 上游默认使用系统信任根。私有 CA 可在这里添加。
 # upstream_ca = "upstream-ca.pem"

@@ -26,11 +26,26 @@ cp proxy.example.toml proxy.toml
 
 ## 配置上游
 
-`upstream` 接受 `socks5://host:port`、`http://host:port` 或 `https://host:port`。HTTP(S) 上游支持 Basic 认证，SOCKS5 上游支持用户名和密码。URL 写法为 `https://user:password@host:port`，凭据中的特殊字符使用百分号编码。Web、请求日志和启动输出中只显示上游协议、主机和端口。
+`upstream` 支持 HTTP、HTTPS、SOCKS5 和 VLESS。HTTP(S) 上游支持 Basic 认证，SOCKS5 上游支持用户名和密码。URL 写法为 `https://user:password@host:port`，凭据中的特殊字符使用百分号编码。Web、请求日志和启动输出中只显示上游协议、主机和端口。
 
 HTTPS 上游验证系统信任链和证书主机名；私有 CA 可以通过 `upstream_ca` 指定。要让客户端通过 TLS **连接本地代理**，在配置中同时设置 PEM 格式的 `inbound_cert` 和 `inbound_key`，让客户端信任该证书。用普通 HTTP 入口访问 HTTPS 网站时无需本地证书。
 
 `connect_timeout_seconds` 控制上游建连与隧道握手期限，默认 10 秒。普通 HTTP 请求从转发开始到收到上游响应头的总期限由 `response_timeout_seconds` 控制，默认 300 秒。已建立的隧道和流式响应可以继续传输。
+
+### VLESS 上游
+
+将节点的 `vless://` 分享链接填入 `proxy.toml` 的 `upstream`，重启程序。下面的 WSS 示例使用占位 UUID 和域名，WebSocket 路径为 `/proxy`。
+
+```toml
+upstream = "vless://00112233-4455-6677-8899-aabbccddeeff@node.example.com:443?type=ws&security=tls&encryption=none&path=%2Fproxy&host=edge.example.com&sni=edge.example.com"
+```
+
+* `type=ws` 使用 WebSocket。`security=tls` 开启 WSS，按 `sni` 校验证书，省略 `sni` 时按节点地址校验。私有 CA 使用 `upstream_ca`。明文 WS 使用 `security=none`，UUID 会在客户端到节点的链路上明文传输。
+* `path` 是百分号编码的 WebSocket 请求路径，默认 `/`。`host` 是握手的 HTTP Host，可与实际拨号地址和 TLS 证书名分别设置。`#` 后面的节点备注可以保留。
+* 原生 TCP 使用 `type=tcp`，也支持 TLS。基础 VLESS 链接由 Rust 直接处理。
+* 在 macOS 和 Linux 上，含 `encryption=mlkem768x25519plus.…`、Vision `flow` 或 TLS `fp` 的链接由程序自动调用 PATH 中的 `xray` 处理。已验证 Xray 26.3.27 的 WSS、VLESS Encryption、Vision 和 Chrome 指纹组合。保留节点提供的完整链接即可，启动命令相同。Rust 与 Xray 通过私有 Unix 套接字通信，程序正常退出时会一并停止 Xray。REALITY 和 gRPC 链接仍会在启动时提示配置错误。
+
+本地客户端仍使用下方的 HTTP 或 SOCKS5 入口。CONNECT 和 SOCKS5 在发出 VLESS 请求头后即可上传数据，节点拒绝 UUID 时会关闭隧道。
 
 ## 让客户端使用代理
 
@@ -65,9 +80,10 @@ curl --noproxy '' --proxy socks5h://127.0.0.1:20808 https://example.com
 ## 验证
 
 ```sh
+cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked
 python3 tests/e2e.py
 ```
 
-端到端测试需要 Python 3 和 OpenSSL CLI，在临时目录和回环端口上运行。覆盖三种上游、入口 TLS、CONNECT、认证拒绝、错误证书、超时、断连、日志持久化，以及上游不可用时对可直连目标的零连接断言。
+端到端测试需要 Python 3 和 OpenSSL CLI，在临时目录和回环端口上运行。覆盖入口 TLS、CONNECT、认证拒绝、错误证书、超时、断连、日志持久化，以及上游不可用时对可直连目标的零连接断言。若 `xray` 在 PATH 中，还会启动本地 Xray 实测 VLESS 的 WS、WSS、TCP 和 TCP + TLS 转发。macOS 和 Linux 上另测 WSS 与 VLESS Encryption、Vision 组合，包括私有 CA 和错误证书名。

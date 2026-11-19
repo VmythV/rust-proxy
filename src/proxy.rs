@@ -1,5 +1,5 @@
 use crate::{
-    config::Upstream,
+    config::{Protocol, Upstream},
     journal::{Counts, Entry, Journal},
     upstream::{self, Socket, Target},
 };
@@ -173,7 +173,8 @@ async fn forward(
     let authority = parts.uri.authority().context("missing target")?.to_string();
     strip_hop_headers(&mut parts.headers);
     parts.headers.insert(HOST, authority.parse()?);
-    let stream = if up.socks {
+    let http_proxy = matches!(up.protocol, Protocol::Http);
+    let stream = if !http_proxy {
         parts.uri = Uri::builder()
             .path_and_query(
                 parts
@@ -190,7 +191,7 @@ async fn forward(
             .context("upstream connection timed out")??
     };
     let mut req = Request::from_parts(parts, Body::new(Metered::new(body, counts, None)));
-    if !up.socks {
+    if http_proxy {
         up.authorize(&mut req)?;
     }
     let mut client = upstream::http(stream).await?;
@@ -199,7 +200,7 @@ async fn forward(
         .await
         .context("upstream HTTP transfer failed")?;
     ensure!(
-        up.socks || resp.status() != StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+        !http_proxy || resp.status() != StatusCode::PROXY_AUTHENTICATION_REQUIRED,
         "upstream HTTP authentication rejected"
     );
     Ok(resp)

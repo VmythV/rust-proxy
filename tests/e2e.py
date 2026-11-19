@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import socket
 import socketserver
@@ -19,6 +20,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("PROXY_BIN", ROOT / "target/debug/rust-proxy"))
+VLESS_ID = "00112233-4455-6677-8899-aabbccddeeff"
 
 
 def readn(f, n):
@@ -163,6 +165,50 @@ def running(directory, upstream, extra="", env=None):
         proc.wait(timeout=5)
 
 
+@contextlib.contextmanager
+def xray_node(directory, certs, network, security, encrypted=False):
+    port = free_port()
+    stream = {"network": network, "security": security}
+    client = {"id": VLESS_ID}
+    encryption = decryption = "none"
+    if encrypted:
+        keys = dict(line.split(": ", 1) for line in subprocess.check_output(["xray", "mlkem768"], text=True).splitlines())
+        encryption = "mlkem768x25519plus.native.0rtt." + keys["Client"]
+        decryption = "mlkem768x25519plus.native.600s." + keys["Seed"]
+        client["flow"] = "xtls-rprx-vision"
+    url = f"vless://{VLESS_ID}@127.0.0.1:{port}?type={network}&security={security}&encryption={encryption}"
+    if encrypted:
+        url += "&flow=xtls-rprx-vision&fp=chrome"
+    if network == "ws":
+        stream["wsSettings"] = {"path": "/edge/test", "host": "edge.invalid"}
+        path = "edge%2Ftest" if encrypted else "%2Fedge%2Ftest"
+        url += f"&path={path}&host=edge.invalid"
+    if security == "tls":
+        stream["tlsSettings"] = {"certificates": [
+            {"certificateFile": str(certs / "cert.pem"), "keyFile": str(certs / "key.pem")}]}
+        url += "&sni=localhost"
+    config = {"inbounds": [{"listen": "127.0.0.1", "port": port, "protocol": "vless",
+              "settings": {"clients": [client], "decryption": decryption},
+              "streamSettings": stream}], "outbounds": [{"protocol": "freedom"}]}
+    config_path = directory / "xray.json"
+    config_path.write_text(json.dumps(config))
+    with subprocess.Popen(["xray", "run", "-config", config_path], stdout=subprocess.DEVNULL) as xray:
+        try:
+            for _ in range(100):
+                if xray.poll() is not None:
+                    raise RuntimeError("Xray exited during startup")
+                try:
+                    socket.create_connection(("127.0.0.1", port), timeout=.2).close()
+                    break
+                except OSError:
+                    time.sleep(.02)
+            else:
+                raise TimeoutError("Xray startup")
+            yield url, f"vless://127.0.0.1:{port}"
+        finally:
+            xray.terminate()
+
+
 def http_request(proxy, url, tls=None):
     if tls:
         conn = http.client.HTTPSConnection("127.0.0.1", proxy, context=tls, timeout=4)
@@ -213,6 +259,67 @@ class ProxyTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.certs.cleanup()
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("xray"), "Unix and Xray required")
+    def test_encrypted_wss_vision(self):
+        def origin(sock):
+            with sock.makefile("rb") as f:
+                read_head(f)
+                self.assertEqual(readn(f, 5), b"hello")
+                sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp, listener(origin) as dest:
+            directory = Path(tmp)
+            env = {**os.environ, "TMPDIR": tmp}
+            with xray_node(directory, Path(self.certs.name), "ws", "tls", encrypted=True) as (url, label):
+                with running(directory, url, self.tls_config, env) as (proxy, web):
+                    self.assertEqual(http_request(proxy, f"http://127.0.0.1:{dest}/"), (200, b"ok"))
+                    self.assertEqual(api(web, "/api/config")["upstream"], label)
+                    relay, = directory.glob("rust-proxy-*")
+                    self.assertEqual(relay.stat().st_mode & 0o777, 0o700)
+                self.assertFalse(relay.exists())
+                with running(directory, url.replace("sni=localhost", "sni=wrong.invalid"), self.tls_config, env) as (proxy, _):
+                    self.assertEqual(http_request(proxy, f"http://127.0.0.1:{dest}/")[0], 502)
+
+    @unittest.skipUnless(shutil.which("xray"), "Xray required for VLESS interoperability test")
+    def test_vless_xray(self):
+        def origin(sock):
+            with sock.makefile("rb") as f:
+                line, headers = read_head(f)
+                self.assertEqual(line, "POST /via-xray?q=ok HTTP/1.1")
+                self.assertNotIn("proxy-authorization", headers)
+                body = readn(f, int(headers["content-length"]))
+                sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n" + body)
+
+        def echo_server(sock):
+            with sock.makefile("rb") as f:
+                echo(sock, f)
+
+        certs = Path(self.certs.name)
+        with tempfile.TemporaryDirectory() as tmp, listener(origin) as dest, listener(echo_server) as echo_port:
+            directory = Path(tmp)
+            for network, security in (("ws", "tls"), ("ws", "none"), ("tcp", "none"), ("tcp", "tls")):
+                with self.subTest(network=network, security=security), xray_node(directory, certs, network, security) as (url, label):
+                    with running(directory, url + "#private-name", self.tls_config) as (proxy, web):
+                        self.assertEqual(http_request(proxy, f"http://127.0.0.1:{dest}/via-xray?q=ok"), (200, b"hello"))
+                        for socks in (False, True):
+                            with tunnel(proxy, "localhost", echo_port, socks) as (code, s, f):
+                                self.assertEqual(code, 0 if socks else 200)
+                                payload = bytes(range(32, 256)) * 300 + b"\n"
+                                s.sendall(payload)
+                                self.assertEqual(readn(f, len(payload)), payload)
+                        self.assertEqual(api(web, "/api/config")["upstream"], label)
+                        self.assertEqual(api(web, "/api/traffic")["rows"][0]["upstream"], label)
+                    if network == "ws" and security == "tls":
+                        for invalid, error in ((url.replace("sni=localhost", "sni=wrong.invalid"), "TLS"),
+                                               (url.replace("host=edge.invalid", "host=wrong.invalid"), "WebSocket"),
+                                               (url.replace("%2Fedge%2Ftest", "%2Fwrong"), "WebSocket")):
+                            with running(directory, invalid, self.tls_config) as (proxy, web):
+                                with tunnel(proxy, "127.0.0.1", echo_port) as (code, _, _):
+                                    self.assertEqual(code, 502)
+                                self.assertIn(error, api(web, "/api/traffic")["rows"][0]["outcome"])
+                        with running(directory, url.replace("00112233", "00000000"), self.tls_config) as (proxy, _):
+                            self.assertEqual(http_request(proxy, f"http://127.0.0.1:{dest}/via-xray?q=ok")[0], 502)
 
     def test_protocol_matrix_and_journal(self):
         for scheme in ["http","https","socks5"]:

@@ -1,4 +1,4 @@
-use crate::config::Upstream;
+use crate::config::{Protocol, Upstream};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use axum::{
     body::Body,
@@ -11,13 +11,12 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
-use std::{net::IpAddr, str::FromStr};
+use std::net::IpAddr;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     time::timeout,
 };
-use tokio_rustls::rustls::pki_types::ServerName;
 
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Stream for T {}
@@ -53,6 +52,26 @@ impl Target {
             format!("{}:{}", self.host, self.port)
         }
     }
+
+    pub fn encode_address(&self, buf: &mut Vec<u8>, domain_type: u8, ipv6_type: u8) -> Result<()> {
+        match self.host.parse::<IpAddr>() {
+            Ok(IpAddr::V4(ip)) => {
+                buf.push(1);
+                buf.extend(ip.octets());
+            }
+            Ok(IpAddr::V6(ip)) => {
+                buf.push(ipv6_type);
+                buf.extend(ip.octets());
+            }
+            Err(_) => {
+                let n = u8::try_from(self.host.len())
+                    .map_err(|_| anyhow!("destination domain too long"))?;
+                buf.extend([domain_type, n]);
+                buf.extend(self.host.as_bytes());
+            }
+        }
+        Ok(())
+    }
 }
 
 pub async fn http(stream: Socket) -> Result<http1::SendRequest<Body>> {
@@ -66,17 +85,14 @@ pub async fn http(stream: Socket) -> Result<http1::SendRequest<Body>> {
 }
 
 impl Upstream {
-    // Every outbound socket originates here. The destination is only encoded in
-    // protocol messages and is never supplied to the resolver or TCP dialer.
+    // Native transports dial the configured upstream. Only protocol messages contain the destination.
     pub async fn transport(&self) -> Result<Socket> {
         let tcp = TcpStream::connect((self.host.as_str(), self.port))
             .await
             .context("connect to upstream")?;
-        if let Some(tls) = &self.tls {
-            let name =
-                ServerName::try_from(self.host.clone()).context("invalid upstream TLS name")?;
+        if let Some((tls, name)) = &self.tls {
             return Ok(Box::new(
-                tls.connect(name, tcp)
+                tls.connect(name.clone(), tcp)
                     .await
                     .context("upstream TLS verification or handshake failed")?,
             ));
@@ -98,10 +114,15 @@ impl Upstream {
 
     pub async fn tunnel(&self, dest: &Target) -> Result<Socket> {
         timeout(self.timeout, async {
-            let stream = self.transport().await?;
-            if self.socks {
-                return self.socks_connect(stream, dest).await;
-            }
+            let stream = match &self.protocol {
+                Protocol::Vless(vless) => {
+                    return vless.connect(self.transport().await?, dest).await;
+                }
+                Protocol::Socks5 => return self.socks_connect(self.transport().await?, dest).await,
+                #[cfg(unix)]
+                Protocol::Xray(relay) => relay.connect().await?,
+                Protocol::Http => self.transport().await?,
+            };
             let mut client = http(stream).await?;
             let target = dest.authority();
             let mut req = Request::builder()
@@ -154,22 +175,7 @@ impl Upstream {
             ensure!(choice == [1, 0], "SOCKS5 authentication rejected");
         }
         let mut req = vec![5, 1, 0];
-        match IpAddr::from_str(&dest.host) {
-            Ok(IpAddr::V4(ip)) => {
-                req.push(1);
-                req.extend(ip.octets());
-            }
-            Ok(IpAddr::V6(ip)) => {
-                req.push(4);
-                req.extend(ip.octets());
-            }
-            Err(_) => {
-                let n =
-                    u8::try_from(dest.host.len()).map_err(|_| anyhow!("SOCKS5 domain too long"))?;
-                req.extend([3, n]);
-                req.extend(dest.host.as_bytes());
-            }
-        }
+        dest.encode_address(&mut req, 3, 4)?;
         req.extend(dest.port.to_be_bytes());
         s.write_all(&req).await?;
         let mut reply = [0; 4];

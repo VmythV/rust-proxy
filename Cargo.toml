@@ -6,6 +6,7 @@ rust-version = "1.89"
 
 [dependencies]
 anyhow = "1"
+async-tungstenite = { version = "0.35", default-features = false, features = ["tokio-runtime"] }
 axum = "0.8"
 base64 = "0.22"
 futures-util = "0.3"
@@ -22,3 +23,6 @@ tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 toml = "0.9"
 url = "2"
+
+[target."cfg(unix)".dependencies]
+tempfile = "3.22"

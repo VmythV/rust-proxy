@@ -3,7 +3,10 @@ mod egress;
 mod journal;
 mod proxy;
 mod upstream;
+mod vless;
 mod web;
+#[cfg(unix)]
+mod xray;
 
 use anyhow::{Context, Result, bail};
 use std::{env, path::PathBuf, sync::Arc};
@@ -25,7 +28,8 @@ async fn main() -> Result<()> {
     };
     anyhow::ensure!(args.next().is_none(), "too many arguments");
     let config = config::Config::load(&path)?;
-    let upstream = Arc::new(config.upstream()?);
+    let (upstream, mut worker) = config.upstream().await?;
+    let upstream = Arc::new(upstream);
     let tls = config.inbound_tls()?;
     let proxy = TcpListener::bind(config.proxy_listen)
         .await
@@ -46,10 +50,36 @@ async fn main() -> Result<()> {
         upstream.label,
         web.local_addr()?
     );
+    let worker_exit = async {
+        match worker.as_mut() {
+            Some(child) => child.wait().await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::select! {
         result = proxy::serve(proxy, tls, upstream, journal) => result?,
         result = axum::serve(web, dashboard) => result?,
-        result = tokio::signal::ctrl_c() => result?,
+        result = shutdown() => result?,
+        status = worker_exit => bail!("Xray exited ({})", status?),
+    }
+    if let Some(mut child) = worker {
+        child.kill().await?;
     }
     Ok(())
+}
+
+async fn shutdown() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate())?;
+        let mut hangup = signal(SignalKind::hangup())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = term.recv() => Ok(()),
+            _ = hangup.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }
